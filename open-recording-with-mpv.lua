@@ -115,8 +115,12 @@ function setTakeDisplay(n){ti().value=String(n).padStart(2,'0');}
 async function post(filename,take){
   return fetch('/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename,take})});
 }
+let lastFilename=null;
 async function doSet(){
-  const name=fi().value.trim();const take=getTake();const s=si();
+  const name=fi().value.trim();
+  if(lastFilename!==null&&name!==lastFilename){setTakeDisplay(1);}
+  lastFilename=name;
+  const take=getTake();const s=si();
   s.textContent='送信中...';s.className='';
   try{
     const r=await post(name,take);
