@@ -8,8 +8,13 @@ obs = obslua
 local ps1_path       = ""   -- 起動オプションを仕込んだps1ファイルのフルパス
 local delay_ms       = 2000 -- 録画停止からmpv起動までの遅延（ミリ秒）
                              -- mkv→mp4リマックス等の後処理がある場合は長めに設定
-local enabled        = true -- スクリプトの有効/無効トグル
-local preset_filename = ""  -- 録画ファイルのリネーム先ファイル名（拡張子なし、空欄でスキップ）
+local enabled         = true -- スクリプトの有効/無効トグル
+local preset_filename = ""   -- 録画ファイルのリネーム先ファイル名（拡張子なし、空欄でスキップ）
+local server_port     = 4050 -- ブラウザドック連携用ローカルHTTPサーバーのポート番号
+
+-- HTTPサーバー状態
+local http_server     = nil
+local pending_clients = {}
 
 -- ---------------------------------------------------------------
 -- ユーティリティ
@@ -30,7 +35,166 @@ local function warn(msg)
 end
 
 -- ---------------------------------------------------------------
--- mpv起動
+-- ローカル HTTP サーバー（ljsocket 経由、ブラウザドック連携）
+-- ---------------------------------------------------------------
+
+local function http_ok(body)
+    local hdrs = table.concat({
+        "HTTP/1.1 200 OK",
+        "Content-Type: application/json",
+        "Content-Length: " .. #body,
+        "Access-Control-Allow-Origin: *",
+        "Access-Control-Allow-Methods: POST, OPTIONS",
+        "Access-Control-Allow-Headers: Content-Type",
+        "Connection: close",
+    }, "\r\n")
+    return hdrs .. "\r\n\r\n" .. body
+end
+
+local function http_err(status, msg)
+    local body = '{"error":"' .. msg .. '"}'
+    local hdrs = table.concat({
+        "HTTP/1.1 " .. status,
+        "Content-Type: application/json",
+        "Content-Length: " .. #body,
+        "Access-Control-Allow-Origin: *",
+        "Access-Control-Allow-Methods: POST, OPTIONS",
+        "Access-Control-Allow-Headers: Content-Type",
+        "Connection: close",
+    }, "\r\n")
+    return hdrs .. "\r\n\r\n" .. body
+end
+
+local DOCK_HTML = [[<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>録画ファイル名</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"Segoe UI",sans-serif;background:#1D1F26;color:#fff;padding:10px}
+label{display:block;font-size:11px;color:#969696;margin-bottom:4px}
+input{width:100%;padding:6px 8px;font-size:13px;background:#3C404D;color:#fff;border:1px solid #5B6273;border-radius:4px;outline:none}
+input:focus{border-color:#284CB8}
+button{margin-top:6px;width:100%;padding:7px;font-size:13px;background:#3C404D;color:#fff;border:1px solid #3C404D;border-radius:4px;cursor:pointer}
+button:hover{background:#464B59;border-color:#5B6273}
+button:active{background:#1D1F26}
+#s{margin-top:6px;font-size:11px;color:#969696;min-height:16px}
+#s.ok{color:#59D966}#s.err{color:#E85E75}
+</style>
+</head>
+<body>
+<label for="f">録画ファイル名（拡張子なし）</label>
+<input type="text" id="f" placeholder="例: gameplay_round1">
+<button onclick="set()">セット</button>
+<div id="s"></div>
+<script>
+async function set(){
+  const name=document.getElementById('f').value.trim();
+  const s=document.getElementById('s');
+  s.textContent='送信中...';s.className='';
+  try{
+    const r=await fetch('/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name})});
+    if(r.ok){s.textContent=name===''?'クリアしました':'「'+name+'」をセットしました';s.className='ok';}
+    else{s.textContent='エラー: HTTP '+r.status;s.className='err';}
+  }catch{s.textContent='接続失敗。スクリプトが起動しているか確認してください。';s.className='err';}
+}
+document.getElementById('f').addEventListener('keydown',e=>{if(e.key==='Enter')set();});
+</script>
+</body>
+</html>]]
+
+local function http_html(body)
+    local hdrs = table.concat({
+        "HTTP/1.1 200 OK",
+        "Content-Type: text/html; charset=utf-8",
+        "Content-Length: " .. #body,
+        "Connection: close",
+    }, "\r\n")
+    return hdrs .. "\r\n\r\n" .. body
+end
+
+local function handle_http(req)
+    local method = req:match("^(%u+) ")
+    if method == "OPTIONS" then return http_ok("") end
+
+    if method == "GET" and req:match("^GET / ") then
+        return http_html(DOCK_HTML)
+    end
+
+    if method == "POST" and req:match("^POST /set ") then
+        local filename = req:match('"filename"%s*:%s*"([^"]*)"')
+        if filename == nil then return http_err("400 Bad Request", "missing filename") end
+        preset_filename = filename
+        log("ブラウザドックからファイル名を設定: \"" .. filename .. "\"")
+        return http_ok('{"ok":true}')
+    end
+
+    return http_err("404 Not Found", "not found")
+end
+
+local function poll_server()
+    if not http_server then return end
+
+    local client = http_server:accept()
+    if client then
+        client:set_blocking(false)
+        table.insert(pending_clients, { socket = client, buf = "" })
+    end
+
+    local i = 1
+    while i <= #pending_clients do
+        local c = pending_clients[i]
+        local data, err = c.socket:receive(4096)
+
+        if data and #data > 0 then
+            c.buf = c.buf .. data
+            if c.buf:find("\r\n\r\n") then
+                c.socket:send(handle_http(c.buf))
+                c.socket:close()
+                table.remove(pending_clients, i)
+                i = i - 1
+            end
+        elseif err == "closed" then
+            table.remove(pending_clients, i)
+            i = i - 1
+        end
+        i = i + 1
+    end
+end
+
+local function start_server()
+    local ok, ljsocket = pcall(require, "ljsocket")
+    if not ok then
+        warn("ljsocket.lua が見つかりません。ブラウザドック連携は無効です。")
+        return
+    end
+
+    local server, err = ljsocket.bind("127.0.0.1", tostring(server_port))
+    if not server then
+        warn("HTTPサーバーのバインドに失敗 (port=" .. server_port .. "): " .. tostring(err))
+        return
+    end
+
+    server:listen(5)
+    server:set_blocking(false)
+    http_server = server
+    obs.timer_add(poll_server, 100)
+    log("HTTPサーバー起動: http://127.0.0.1:" .. server_port)
+end
+
+local function stop_server()
+    obs.timer_remove(poll_server)
+    for _, c in ipairs(pending_clients) do pcall(function() c.socket:close() end) end
+    pending_clients = {}
+    if http_server then
+        http_server:close()
+        http_server = nil
+    end
+end
+
+-- ---------------------------------------------------------------
+-- リネーム・mpv起動
 -- ---------------------------------------------------------------
 
 --- パスからディレクトリ部分を返す（末尾スラッシュなし）
@@ -164,11 +328,13 @@ end
 function script_properties()
     local props = obs.obs_properties_create()
 
-    obs.obs_properties_add_text(
+    obs.obs_properties_add_int(
         props,
-        "preset_filename",
-        "録画ファイル名（拡張子なし、空欄でスキップ）",
-        obs.OBS_TEXT_DEFAULT
+        "server_port",
+        "ブラウザドック連携ポート番号",
+        1024,  -- 最小
+        65535, -- 最大
+        1      -- ステップ
     )
 
     obs.obs_properties_add_path(
@@ -199,21 +365,30 @@ function script_properties()
 end
 
 function script_defaults(settings)
-    obs.obs_data_set_default_string(settings, "preset_filename", "")
-    obs.obs_data_set_default_string(settings, "ps1_path",        "")
-    obs.obs_data_set_default_int   (settings, "delay_ms",       2000)
-    obs.obs_data_set_default_bool  (settings, "enabled",         true)
+    obs.obs_data_set_default_int   (settings, "server_port",  4050)
+    obs.obs_data_set_default_string(settings, "ps1_path",     "")
+    obs.obs_data_set_default_int   (settings, "delay_ms",     2000)
+    obs.obs_data_set_default_bool  (settings, "enabled",      true)
 end
 
 function script_update(settings)
-    preset_filename = obs.obs_data_get_string(settings, "preset_filename")
-    ps1_path        = obs.obs_data_get_string(settings, "ps1_path")
-    delay_ms        = obs.obs_data_get_int   (settings, "delay_ms")
-    enabled         = obs.obs_data_get_bool  (settings, "enabled")
+    local new_port = obs.obs_data_get_int   (settings, "server_port")
+    ps1_path       = obs.obs_data_get_string(settings, "ps1_path")
+    delay_ms       = obs.obs_data_get_int   (settings, "delay_ms")
+    enabled        = obs.obs_data_get_bool  (settings, "enabled")
+
+    -- ポート番号が変わった場合はサーバーを再起動
+    if new_port ~= server_port and http_server then
+        server_port = new_port
+        stop_server()
+        start_server()
+    else
+        server_port = new_port
+    end
 
     log(string.format(
-        "設定を更新しました: preset=%s, ps1=%s, delay=%dms, enabled=%s",
-        preset_filename, ps1_path, delay_ms, tostring(enabled)
+        "設定を更新しました: port=%d, ps1=%s, delay=%dms, enabled=%s",
+        server_port, ps1_path, delay_ms, tostring(enabled)
     ))
 end
 
@@ -225,9 +400,10 @@ function script_description()
     return [[<b>録画終了後にmpvで再生</b><br><br>
 録画が終了すると、指定したPowerShellスクリプト (.ps1) を使ってmpvを起動し、
 録画した動画を再生します。<br><br>
-<b>録画ファイル名について:</b><br>
-「録画ファイル名」に値を入力しておくと、録画終了後に自動でリネームします。<br>
-拡張子は元のファイルと同じものが使われます。空欄の場合はリネームをスキップします。<br><br>
+<b>ブラウザドック連携について:</b><br>
+filename-dock.html をカスタムブラウザドックに登録すると、
+録画前にファイル名を素早くセットできます。<br>
+ファイルを開く前に URL 欄に「file:///」+ フルパスを入力してください。<br><br>
 <b>ps1ファイルの書き方例:</b><br>
 <pre>param([string]$VideoPath)
 & mpv $VideoPath --geometry=50% --ontop</pre>
@@ -244,10 +420,12 @@ end
 
 function script_load(settings)
     obs.obs_frontend_add_event_callback(on_obs_frontend_event)
+    start_server()
     log("open_recording_with_mpv.lua を読み込みました")
 end
 
 function script_unload()
+    stop_server()
     obs.obs_frontend_remove_event_callback(on_obs_frontend_event)
     pending_path = nil
     log("open_recording_with_mpv.lua をアンロードしました")
