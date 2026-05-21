@@ -74,7 +74,7 @@ local DOCK_HTML = [[<!DOCTYPE html>
 <title>録画ファイル名</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:"Segoe UI",sans-serif;background:#1D1F26;color:#fff;padding:10px}
+body{font-family:"Segoe UI",sans-serif;background:#272a33;color:#fff;padding:10px}
 label{display:block;font-size:11px;color:#969696;margin-bottom:4px}
 input{padding:6px 8px;font-size:13px;background:#3C404D;color:#fff;border:1px solid #5B6273;border-radius:4px;outline:none}
 input:focus{border-color:#284CB8}
