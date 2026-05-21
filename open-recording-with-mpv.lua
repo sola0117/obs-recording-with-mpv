@@ -53,11 +53,12 @@ local function rename_recording(orig_path, new_name)
     local ext  = extname(orig_path)
     local dest = dir .. "/" .. new_name .. ext
 
-    -- 同名ファイルが既に存在する場合は警告
+    -- 同名ファイルが既に存在する場合はリネームをスキップ
     local f = io.open(dest, "r")
     if f ~= nil then
         f:close()
-        warn("リネーム先に同名ファイルが存在します。上書きします: " .. dest)
+        warn("リネーム先に同名ファイルが存在するためスキップします: " .. dest)
+        return orig_path
     end
 
     local ok, err = os.rename(orig_path, dest)
