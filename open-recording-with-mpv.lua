@@ -5,10 +5,11 @@
 obs = obslua
 
 -- スクリプト設定のデフォルト値
-local ps1_path    = ""   -- 起動オプションを仕込んだps1ファイルのフルパス
-local delay_ms    = 2000 -- 録画停止からmpv起動までの遅延（ミリ秒）
-                         -- mkv→mp4リマックス等の後処理がある場合は長めに設定
-local enabled     = true -- スクリプトの有効/無効トグル
+local ps1_path       = ""   -- 起動オプションを仕込んだps1ファイルのフルパス
+local delay_ms       = 2000 -- 録画停止からmpv起動までの遅延（ミリ秒）
+                             -- mkv→mp4リマックス等の後処理がある場合は長めに設定
+local enabled        = true -- スクリプトの有効/無効トグル
+local preset_filename = ""  -- 録画ファイルのリネーム先ファイル名（拡張子なし、空欄でスキップ）
 
 -- ---------------------------------------------------------------
 -- ユーティリティ
@@ -31,6 +32,43 @@ end
 -- ---------------------------------------------------------------
 -- mpv起動
 -- ---------------------------------------------------------------
+
+--- パスからディレクトリ部分を返す（末尾スラッシュなし）
+local function dirname(path)
+    return path:match("^(.*)[/\\][^/\\]*$") or "."
+end
+
+--- パスから拡張子（ドット含む）を返す
+local function extname(path)
+    return path:match("(\.[^./\\]+)$") or ""
+end
+
+--- ファイルをリネームし、新しいパスを返す。失敗時は元のパスを返す。
+--- @param orig_path string  元のファイルパス
+--- @param new_name  string  新しいファイル名（拡張子なし）
+local function rename_recording(orig_path, new_name)
+    if new_name == "" then return orig_path end
+
+    local dir  = dirname(orig_path)
+    local ext  = extname(orig_path)
+    local dest = dir .. "/" .. new_name .. ext
+
+    -- 同名ファイルが既に存在する場合は警告
+    local f = io.open(dest, "r")
+    if f ~= nil then
+        f:close()
+        warn("リネーム先に同名ファイルが存在します。上書きします: " .. dest)
+    end
+
+    local ok, err = os.rename(orig_path, dest)
+    if not ok then
+        warn("リネームに失敗しました: " .. tostring(err))
+        return orig_path
+    end
+
+    log("リネーム完了: " .. orig_path .. " → " .. dest)
+    return dest
+end
 
 --- PowerShellスクリプト経由でmpvを起動する
 --- @param video_path string  再生する動画ファイルのフルパス
@@ -76,7 +114,9 @@ local pending_path = nil  -- 起動待ちのファイルパス
 local function on_timer()
     obs.remove_current_callback()
     if pending_path ~= nil then
-        launch_mpv(pending_path)
+        -- リネームが設定されていれば先に実行し、mpvには新しいパスを渡す
+        local final_path = rename_recording(pending_path, preset_filename)
+        launch_mpv(final_path)
         pending_path = nil
     end
 end
@@ -123,6 +163,13 @@ end
 function script_properties()
     local props = obs.obs_properties_create()
 
+    obs.obs_properties_add_text(
+        props,
+        "preset_filename",
+        "録画ファイル名（拡張子なし、空欄でスキップ）",
+        obs.OBS_TEXT_DEFAULT
+    )
+
     obs.obs_properties_add_path(
         props,
         "ps1_path",
@@ -151,19 +198,21 @@ function script_properties()
 end
 
 function script_defaults(settings)
-    obs.obs_data_set_default_string(settings, "ps1_path",  "")
-    obs.obs_data_set_default_int   (settings, "delay_ms", 2000)
-    obs.obs_data_set_default_bool  (settings, "enabled",   true)
+    obs.obs_data_set_default_string(settings, "preset_filename", "")
+    obs.obs_data_set_default_string(settings, "ps1_path",        "")
+    obs.obs_data_set_default_int   (settings, "delay_ms",       2000)
+    obs.obs_data_set_default_bool  (settings, "enabled",         true)
 end
 
 function script_update(settings)
-    ps1_path  = obs.obs_data_get_string(settings, "ps1_path")
-    delay_ms  = obs.obs_data_get_int   (settings, "delay_ms")
-    enabled   = obs.obs_data_get_bool  (settings, "enabled")
+    preset_filename = obs.obs_data_get_string(settings, "preset_filename")
+    ps1_path        = obs.obs_data_get_string(settings, "ps1_path")
+    delay_ms        = obs.obs_data_get_int   (settings, "delay_ms")
+    enabled         = obs.obs_data_get_bool  (settings, "enabled")
 
     log(string.format(
-        "設定を更新しました: ps1=%s, delay=%dms, enabled=%s",
-        ps1_path, delay_ms, tostring(enabled)
+        "設定を更新しました: preset=%s, ps1=%s, delay=%dms, enabled=%s",
+        preset_filename, ps1_path, delay_ms, tostring(enabled)
     ))
 end
 
@@ -175,6 +224,9 @@ function script_description()
     return [[<b>録画終了後にmpvで再生</b><br><br>
 録画が終了すると、指定したPowerShellスクリプト (.ps1) を使ってmpvを起動し、
 録画した動画を再生します。<br><br>
+<b>録画ファイル名について:</b><br>
+「録画ファイル名」に値を入力しておくと、録画終了後に自動でリネームします。<br>
+拡張子は元のファイルと同じものが使われます。空欄の場合はリネームをスキップします。<br><br>
 <b>ps1ファイルの書き方例:</b><br>
 <pre>param([string]$VideoPath)
 & mpv $VideoPath --geometry=50% --ontop</pre>
