@@ -10,6 +10,8 @@ local delay_ms       = 2000 -- 録画停止からmpv起動までの遅延（ミ�
                              -- mkv→mp4リマックス等の後処理がある場合は長めに設定
 local enabled         = true -- スクリプトの有効/無効トグル
 local preset_filename = ""   -- 録画ファイルのリネーム先ファイル名（拡張子なし、空欄でスキップ）
+local take_number     = 1    -- テイク番号（録画終了ごとに自動インクリメント）
+local state_ver       = 0    -- 状態変化を通知するバージョン番号
 local server_port     = 4050 -- ブラウザドック連携用ローカルHTTPサーバーのポート番号
 
 -- HTTPサーバー状態
@@ -74,32 +76,80 @@ local DOCK_HTML = [[<!DOCTYPE html>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:"Segoe UI",sans-serif;background:#1D1F26;color:#fff;padding:10px}
 label{display:block;font-size:11px;color:#969696;margin-bottom:4px}
-input{width:100%;padding:6px 8px;font-size:13px;background:#3C404D;color:#fff;border:1px solid #5B6273;border-radius:4px;outline:none}
+input{padding:6px 8px;font-size:13px;background:#3C404D;color:#fff;border:1px solid #5B6273;border-radius:4px;outline:none}
 input:focus{border-color:#284CB8}
-button{margin-top:6px;width:100%;padding:7px;font-size:13px;background:#3C404D;color:#fff;border:1px solid #3C404D;border-radius:4px;cursor:pointer}
+.row{display:flex;gap:6px;align-items:center}
+#f{flex:1}
+#t{width:48px;text-align:center}
+button{padding:7px 10px;font-size:13px;background:#3C404D;color:#fff;border:1px solid #3C404D;border-radius:4px;cursor:pointer;white-space:nowrap}
 button:hover{background:#464B59;border-color:#5B6273}
 button:active{background:#1D1F26}
+.btn-row{display:flex;gap:6px;margin-top:6px}
+#btn-set{flex:1}
+#btn-dec,#btn-inc{width:36px}
 #s{margin-top:6px;font-size:11px;color:#969696;min-height:16px}
 #s.ok{color:#59D966}#s.err{color:#E85E75}
 </style>
 </head>
 <body>
-<label for="f">録画ファイル名（拡張子なし）</label>
-<input type="text" id="f" placeholder="例: gameplay_round1">
-<button onclick="set()">セット</button>
+<div class="row" style="margin-bottom:4px">
+  <label for="f" style="margin:0;flex:1">録画ファイル名（拡張子なし）</label>
+  <label for="t" style="margin:0;color:#969696;font-size:11px">テイク</label>
+</div>
+<div class="row">
+  <input type="text" id="f" placeholder="例: gameplay">
+  <input type="text" id="t" value="01" maxlength="2">
+</div>
+<div class="btn-row">
+  <button id="btn-set" onclick="doSet()">セット</button>
+  <button id="btn-dec" onclick="adj(-1)">－</button>
+  <button id="btn-inc" onclick="adj(+1)">＋</button>
+</div>
 <div id="s"></div>
 <script>
-async function set(){
-  const name=document.getElementById('f').value.trim();
-  const s=document.getElementById('s');
+const fi=()=>document.getElementById('f');
+const ti=()=>document.getElementById('t');
+const si=()=>document.getElementById('s');
+function getTake(){return Math.max(1,parseInt(ti().value)||1);}
+function setTakeDisplay(n){ti().value=String(n).padStart(2,'0');}
+async function post(filename,take){
+  return fetch('/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename,take})});
+}
+let lastFilename=null;
+async function doSet(){
+  const name=fi().value.trim();
+  if(lastFilename!==null&&name!==lastFilename){setTakeDisplay(1);}
+  lastFilename=name;
+  const take=getTake();const s=si();
   s.textContent='送信中...';s.className='';
   try{
-    const r=await fetch('/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name})});
-    if(r.ok){s.textContent=name===''?'クリアしました':'「'+name+'」をセットしました';s.className='ok';}
+    const r=await post(name,take);
+    if(r.ok){s.textContent=name===''?'クリアしました':'「'+name+'_t'+String(take).padStart(2,'0')+'」をセットしました';s.className='ok';}
     else{s.textContent='エラー: HTTP '+r.status;s.className='err';}
   }catch{s.textContent='接続失敗。スクリプトが起動しているか確認してください。';s.className='err';}
 }
-document.getElementById('f').addEventListener('keydown',e=>{if(e.key==='Enter')set();});
+async function adj(d){
+  const n=Math.max(1,getTake()+d);
+  setTakeDisplay(n);
+  await post(fi().value.trim(),n);
+}
+ti().addEventListener('change',()=>{setTakeDisplay(getTake());adj(0);});
+fi().addEventListener('keydown',e=>{if(e.key==='Enter')doSet();});
+// サーバーと定期同期（録画終了後の自動インクリメントを検知して自動セット）
+let lastVer=-1;
+setInterval(async()=>{
+  try{
+    const r=await fetch('/state');
+    if(!r.ok)return;
+    const d=await r.json();
+    if(document.activeElement!==ti())setTakeDisplay(d.take);
+    if(lastVer>=0&&d.ver!==lastVer){
+      // 録画終了でインクリメントされたのでセットを自動実行
+      await doSet();
+    }
+    lastVer=d.ver;
+  }catch{}
+},500);
 </script>
 </body>
 </html>]]
@@ -122,11 +172,24 @@ local function handle_http(req)
         return http_html(DOCK_HTML)
     end
 
+    if method == "GET" and req:match("^GET /state ") then
+        local body = string.format(
+            '{"filename":"%s","take":%d,"ver":%d}',
+            preset_filename, take_number, state_ver
+        )
+        return http_ok(body)
+    end
+
     if method == "POST" and req:match("^POST /set ") then
         local filename = req:match('"filename"%s*:%s*"([^"]*)"')
-        if filename == nil then return http_err("400 Bad Request", "missing filename") end
-        preset_filename = filename
-        log("ブラウザドックからファイル名を設定: \"" .. filename .. "\"")
+        local take     = req:match('"take"%s*:%s*(%d+)')
+        if filename ~= nil then
+            preset_filename = filename
+        end
+        if take ~= nil then
+            take_number = math.max(1, tonumber(take))
+        end
+        log(string.format("ブラウザドックから設定: filename=\"%s\" take=%d", preset_filename, take_number))
         return http_ok('{"ok":true}')
     end
 
@@ -279,9 +342,16 @@ local pending_path = nil  -- 起動待ちのファイルパス
 local function on_timer()
     obs.remove_current_callback()
     if pending_path ~= nil then
-        -- リネームが設定されていれば先に実行し、mpvには新しいパスを渡す
-        local final_path = rename_recording(pending_path, preset_filename)
+        local new_name = ""
+        if preset_filename ~= "" then
+            new_name = preset_filename .. "_t" .. string.format("%02d", take_number)
+        end
+        local final_path = rename_recording(pending_path, new_name)
         launch_mpv(final_path)
+        if preset_filename ~= "" then
+            take_number = take_number + 1
+            state_ver   = state_ver + 1
+        end
         pending_path = nil
     end
 end
