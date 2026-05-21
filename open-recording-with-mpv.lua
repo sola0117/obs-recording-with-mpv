@@ -40,7 +40,7 @@ end
 
 --- パスから拡張子（ドット含む）を返す
 local function extname(path)
-    return path:match("(\.[^./\\]+)$") or ""
+    return path:match("(%.[^./\\]+)$") or ""
 end
 
 --- ファイルをリネームし、新しいパスを返す。失敗時は元のパスを返す。
