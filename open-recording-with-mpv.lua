@@ -74,7 +74,7 @@ local DOCK_HTML = [[<!DOCTYPE html>
 <title>録画ファイル名</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:"Segoe UI",sans-serif;background:#1D1F26;color:#fff;padding:10px}
+body{font-family:"Segoe UI",sans-serif;background:#272a33;color:#fff;padding:10px}
 label{display:block;font-size:11px;color:#969696;margin-bottom:4px}
 input{padding:6px 8px;font-size:13px;background:#3C404D;color:#fff;border:1px solid #5B6273;border-radius:4px;outline:none}
 input:focus{border-color:#284CB8}
@@ -202,23 +202,34 @@ local function poll_server()
     local client = http_server:accept()
     if client then
         client:set_blocking(false)
-        table.insert(pending_clients, { socket = client, buf = "" })
+        table.insert(pending_clients, { socket = client, buf = "", t = os.clock() })
     end
 
+    local now = os.clock()
     local i = 1
     while i <= #pending_clients do
         local c = pending_clients[i]
-        local data, err = c.socket:receive(4096)
+        local remove = false
 
-        if data and #data > 0 then
-            c.buf = c.buf .. data
-            if c.buf:find("\r\n\r\n") then
-                c.socket:send(handle_http(c.buf))
-                c.socket:close()
-                table.remove(pending_clients, i)
-                i = i - 1
+        if now - c.t > 3 then
+            -- タイムアウト（3秒以内にリクエストが完了しなかった接続を破棄）
+            remove = true
+        else
+            local data, err = c.socket:receive(4096)
+            if data and #data > 0 then
+                c.buf = c.buf .. data
+                if c.buf:find("\r\n\r\n") then
+                    c.socket:send(handle_http(c.buf))
+                    remove = true
+                end
+            elseif err ~= "tryagain" then
+                -- "closed" およびその他すべてのエラーで破棄
+                remove = true
             end
-        elseif err == "closed" then
+        end
+
+        if remove then
+            pcall(function() c.socket:close() end)
             table.remove(pending_clients, i)
             i = i - 1
         end
