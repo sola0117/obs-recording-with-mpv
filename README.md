@@ -23,7 +23,7 @@ https://github.com/sola0117/mpv-launcher
 └── ljsocket.lua                  ← HTTP サーバー用ライブラリ
 ```
 
-`ljsocket.lua` は [CapsAdmin/luajitsocket](https://github.com/CapsAdmin/luajitsocket) から入手してください。
+`ljsocket.lua` は [CapsAdmin/luajitsocket](https://github.com/CapsAdmin/luajitsocket)（MIT License）を同梱しています。
 
 ## セットアップ
 
