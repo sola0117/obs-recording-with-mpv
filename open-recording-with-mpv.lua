@@ -22,9 +22,54 @@ local pending_clients = {}
 -- ユーティリティ
 -- ---------------------------------------------------------------
 
---- パスをダブルクォートで囲む（スペース対策）
-local function q(path)
-    return '"' .. path .. '"'
+--- 文字列をBase64へ変換する。
+--- PowerShellのコマンドラインへパスを直接埋め込まず、安全に受け渡すために使用する。
+local function base64_encode(data)
+    local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    local result = {}
+
+    for i = 1, #data, 3 do
+        local a = data:byte(i)
+        local b = data:byte(i + 1)
+        local c = data:byte(i + 2)
+
+        result[#result + 1] = alphabet:sub(math.floor(a / 4) + 1, math.floor(a / 4) + 1)
+        result[#result + 1] = alphabet:sub(((a % 4) * 16 + math.floor((b or 0) / 16)) + 1,
+                                           ((a % 4) * 16 + math.floor((b or 0) / 16)) + 1)
+
+        if b then
+            result[#result + 1] = alphabet:sub(((b % 16) * 4 + math.floor((c or 0) / 64)) + 1,
+                                               ((b % 16) * 4 + math.floor((c or 0) / 64)) + 1)
+        else
+            result[#result + 1] = "="
+        end
+
+        if c then
+            result[#result + 1] = alphabet:sub((c % 64) + 1, (c % 64) + 1)
+        else
+            result[#result + 1] = "="
+        end
+    end
+
+    return table.concat(result)
+end
+
+--- PowerShellスクリプトを別プロセスで起動するコマンドを組み立てる。
+--- パスはBase64化してPowerShell側で復元し、外側のシェルには直接渡さない。
+local function build_launch_command(script_path, video_path)
+    local script_b64 = base64_encode(script_path)
+    local video_b64  = base64_encode(video_path)
+
+    return string.format(
+        'powershell.exe -NoProfile -WindowStyle Hidden -Command "' ..
+        '$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\'%s\'));' ..
+        '$v=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\'%s\'));' ..
+        '$q=[char]34;' ..
+        '$a=\'-NoProfile -ExecutionPolicy Bypass -File \'+$q+$p+$q+\' \'+$q+$v+$q;' ..
+        'Start-Process -FilePath \'powershell.exe\' -ArgumentList $a -WindowStyle Hidden"',
+        script_b64,
+        video_b64
+    )
 end
 
 --- ログ出力ヘルパー
@@ -325,15 +370,11 @@ local function launch_mpv(video_path)
     end
     f:close()
 
-    -- PowerShell呼び出しコマンドを組み立てる
-    -- ps1ファイルへ動画パスを引数として渡す
+    -- パスはbuild_launch_command内でBase64化してからPowerShell側で復元する。
+    -- これにより、スペース、日本語、記号を含むOBS既定のファイル名も扱える。
     -- -WindowStyle Hidden: PowerShellウィンドウを非表示
     -- Start-Process powershell で呼ぶことでOBSをブロックしない
-    local cmd = string.format(
-        'powershell.exe -NoProfile -WindowStyle Hidden -Command "Start-Process powershell -ArgumentList \'-NoProfile -ExecutionPolicy Bypass -File %s %s\' -WindowStyle Hidden"',
-        q(ps1_path),
-        q(video_path)
-    )
+    local cmd = build_launch_command(ps1_path, video_path)
 
     log("mpvを起動します: " .. video_path)
     log("コマンド: " .. cmd)
