@@ -54,21 +54,42 @@ local function base64_encode(data)
     return table.concat(result)
 end
 
+--- ASCII文字列をPowerShellの-EncodedCommand用UTF-16LEへ変換する。
+--- 呼び出しコードにはBase64文字列とPowerShell構文しか含めないためASCIIで十分。
+local function ascii_to_utf16le(data)
+    local result = {}
+
+    for i = 1, #data do
+        result[#result + 1] = data:sub(i, i)
+        result[#result + 1] = "\0"
+    end
+
+    return table.concat(result)
+end
+
 --- PowerShellスクリプトを別プロセスで起動するコマンドを組み立てる。
 --- パスはBase64化してPowerShell側で復元し、外側のシェルには直接渡さない。
 local function build_launch_command(script_path, video_path)
     local script_b64 = base64_encode(script_path)
     local video_b64  = base64_encode(video_path)
+    local child_command = string.format(
+        '$ErrorActionPreference=\'Stop\';' ..
+        '$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\'%s\'));' ..
+        '$v=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\'%s\'));' ..
+        '& $p $v',
+        script_b64,
+        video_b64
+    )
+    local encoded_command = base64_encode(ascii_to_utf16le(child_command))
 
     return string.format(
         'powershell.exe -NoProfile -WindowStyle Hidden -Command "' ..
-        '$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\'%s\'));' ..
-        '$v=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\'%s\'));' ..
-        '$q=[char]34;' ..
-        '$a=\'-NoProfile -ExecutionPolicy Bypass -File \'+$q+$p+$q+\' \'+$q+$v+$q;' ..
-        'Start-Process -FilePath \'powershell.exe\' -ArgumentList $a -WindowStyle Hidden"',
-        script_b64,
-        video_b64
+        '$o=Join-Path $env:TEMP \'obs-recording-with-mpv-output.log\';' ..
+        '$e=Join-Path $env:TEMP \'obs-recording-with-mpv-error.log\';' ..
+        'Start-Process -FilePath \'powershell.exe\' ' ..
+        '-ArgumentList \'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand %s\' ' ..
+        '-RedirectStandardOutput $o -RedirectStandardError $e -WindowStyle Hidden"',
+        encoded_command
     )
 end
 
