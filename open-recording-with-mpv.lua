@@ -6,7 +6,7 @@ obs = obslua
 
 -- スクリプト設定のデフォルト値
 local ps1_path       = ""   -- 起動オプションを仕込んだps1ファイルのフルパス
-local delay_ms       = 2000 -- 録画停止からmpv起動までの遅延（ミリ秒）
+local delay_ms       = 200 -- 録画停止からmpv起動までの遅延（ミリ秒）
                              -- mkv→mp4リマックス等の後処理がある場合は長めに設定
 local enabled         = true -- スクリプトの有効/無効トグル
 local preset_filename = ""   -- 録画ファイルのリネーム先ファイル名（拡張子なし、空欄でスキップ）
@@ -22,74 +22,20 @@ local pending_clients = {}
 -- ユーティリティ
 -- ---------------------------------------------------------------
 
---- 文字列をBase64へ変換する。
---- PowerShellのコマンドラインへパスを直接埋め込まず、安全に受け渡すために使用する。
-local function base64_encode(data)
-    local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    local result = {}
-
-    for i = 1, #data, 3 do
-        local a = data:byte(i)
-        local b = data:byte(i + 1)
-        local c = data:byte(i + 2)
-
-        result[#result + 1] = alphabet:sub(math.floor(a / 4) + 1, math.floor(a / 4) + 1)
-        result[#result + 1] = alphabet:sub(((a % 4) * 16 + math.floor((b or 0) / 16)) + 1,
-                                           ((a % 4) * 16 + math.floor((b or 0) / 16)) + 1)
-
-        if b then
-            result[#result + 1] = alphabet:sub(((b % 16) * 4 + math.floor((c or 0) / 64)) + 1,
-                                               ((b % 16) * 4 + math.floor((c or 0) / 64)) + 1)
-        else
-            result[#result + 1] = "="
-        end
-
-        if c then
-            result[#result + 1] = alphabet:sub((c % 64) + 1, (c % 64) + 1)
-        else
-            result[#result + 1] = "="
-        end
-    end
-
-    return table.concat(result)
+--- Windowsコマンドライン用に値をダブルクォートで囲む。
+local function q(value)
+    return '"' .. value .. '"'
 end
 
---- ASCII文字列をPowerShellの-EncodedCommand用UTF-16LEへ変換する。
---- 呼び出しコードにはBase64文字列とPowerShell構文しか含めないためASCIIで十分。
-local function ascii_to_utf16le(data)
-    local result = {}
-
-    for i = 1, #data do
-        result[#result + 1] = data:sub(i, i)
-        result[#result + 1] = "\0"
-    end
-
-    return table.concat(result)
-end
-
---- PowerShellスクリプトを別プロセスで起動するコマンドを組み立てる。
---- パスはBase64化してPowerShell側で復元し、外側のシェルには直接渡さない。
+--- PowerShellスクリプトを非同期で起動するコマンドを組み立てる。
+--- os.executeが利用するcmd.exeのstartを使い、PowerShellの多重起動を避ける。
 local function build_launch_command(script_path, video_path)
-    local script_b64 = base64_encode(script_path)
-    local video_b64  = base64_encode(video_path)
-    local child_command = string.format(
-        '$ErrorActionPreference=\'Stop\';' ..
-        '$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\'%s\'));' ..
-        '$v=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\'%s\'));' ..
-        '& $p $v',
-        script_b64,
-        video_b64
-    )
-    local encoded_command = base64_encode(ascii_to_utf16le(child_command))
-
     return string.format(
-        'powershell.exe -NoProfile -WindowStyle Hidden -Command "' ..
-        '$o=Join-Path $env:TEMP \'obs-recording-with-mpv-output.log\';' ..
-        '$e=Join-Path $env:TEMP \'obs-recording-with-mpv-error.log\';' ..
-        'Start-Process -FilePath \'powershell.exe\' ' ..
-        '-ArgumentList \'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand %s\' ' ..
-        '-RedirectStandardOutput $o -RedirectStandardError $e -WindowStyle Hidden"',
-        encoded_command
+        'start "" /b powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden ' ..
+        '-File %s %s 1>"%%TEMP%%\\obs-recording-with-mpv-output.log" ' ..
+        '2>"%%TEMP%%\\obs-recording-with-mpv-error.log"',
+        q(script_path),
+        q(video_path)
     )
 end
 
@@ -391,10 +337,8 @@ local function launch_mpv(video_path)
     end
     f:close()
 
-    -- パスはbuild_launch_command内でBase64化してからPowerShell側で復元する。
-    -- これにより、スペース、日本語、記号を含むOBS既定のファイル名も扱える。
-    -- -WindowStyle Hidden: PowerShellウィンドウを非表示
-    -- Start-Process powershell で呼ぶことでOBSをブロックしない
+    -- cmd.exeのstart /bでPowerShellを非同期起動し、OBSをブロックしない。
+    -- スクリプトと動画のパスは引用符で囲み、空白を含むパスを1引数として渡す。
     local cmd = build_launch_command(ps1_path, video_path)
 
     log("mpvを起動します: " .. video_path)
