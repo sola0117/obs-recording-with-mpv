@@ -108,6 +108,7 @@ int CreateProcessW(const uint16_t *lpApplicationName, uint16_t *lpCommandLine,
 ]])
 
 local kernel32 = ffi.load("kernel32")
+local user32 = ffi.load("user32")
 
 local CP_UTF8 = 65001
 local GENERIC_READ = 0x80000000
@@ -161,7 +162,7 @@ function M.move_file(source, destination)
 end
 
 function M.monitor_count()
-    return tonumber(kernel32.GetSystemMetrics(SM_CMONITORS))
+    return tonumber(user32.GetSystemMetrics(SM_CMONITORS))
 end
 
 function M.now_ms()
